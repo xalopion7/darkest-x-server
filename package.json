@@ -1,0 +1,12 @@
+{
+  "name": "darkest-x-server",
+  "version": "1.0.0",
+  "description": "Zero-dependency multiplayer server for DARKEST X IN THE CITY",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
