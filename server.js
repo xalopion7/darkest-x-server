@@ -105,7 +105,7 @@ server.on('upgrade', (req, socket) => {
     'Connection: Upgrade\r\n' +
     'Sec-WebSocket-Accept: ' + accept + '\r\n\r\n'
   );
-  const conn = { socket, id: null, acctId: null, name: null, skin: null, x: 0, z: 0, face: 0, party: null, alive: true };
+  const conn = { socket, id: null, acctId: null, name: null, skin: null, x: 0, z: 0, face: 0, party: null, alive: true, driving: false };
   const send = (obj) => { try { socket.write(encodeFrame(JSON.stringify(obj))); } catch (e) {} };
   conn.send = send;
   clients.add(conn);
@@ -123,14 +123,22 @@ server.on('upgrade', (req, socket) => {
 const clients = new Set();               // all connected sockets (wrapper objects)
 const worldByAcct = new Map();            // acctId -> conn (one active session per account)
 const parties = new Map();                // code -> party object
+const lastSeen = new Map();               // acctId -> ms epoch of last disconnect (absent/undefined = never seen or currently online)
+const seats = new Map();                  // seatIdx -> acctId (school classroom seats)
+const chatHistory = [];                   // rolling buffer of recent city-chat messages (persists across reconnects, lost on server restart)
+let chatSeq = 0;
 
 function cleanup(conn) {
   if (!conn.alive) return;
   conn.alive = false;
   clients.delete(conn);
   if (conn.acctId && worldByAcct.get(conn.acctId) === conn) {
+    const ts = Date.now();
     worldByAcct.delete(conn.acctId);
+    lastSeen.set(conn.acctId, ts);
     broadcastCity({ type: 'left', acctId: conn.acctId });
+    broadcastCity({ type: 'presence_one', acctId: conn.acctId, online: false, lastSeen: ts });
+    for (const [seatIdx, owner] of seats) { if (owner === conn.acctId) { seats.delete(seatIdx); broadcastCity({ type: 'seat_update', seat: seatIdx, acctId: null }); } }
   }
   if (conn.party) leaveParty(conn, conn.party);
 }
@@ -156,28 +164,97 @@ function handleMessage(conn, msg) {
     conn.skin = String(msg.skin || 'minion').slice(0, 20);
     conn.x = 0; conn.z = 0; conn.face = 0;
     worldByAcct.set(acc.id, conn);
+    lastSeen.delete(acc.id);
     conn.send({ type: 'login_ok', id: acc.id });
     // tell the newcomer who else is already in the city
     conn.send({
       type: 'roster',
-      players: [...worldByAcct.values()].filter(c => c !== conn).map(c => ({ acctId: c.acctId, name: c.name, skin: c.skin, x: c.x, z: c.z, face: c.face }))
+      players: [...worldByAcct.values()].filter(c => c !== conn).map(c => ({ acctId: c.acctId, name: c.name, skin: c.skin, x: c.x, z: c.z, face: c.face, driving: c.driving }))
     });
+    // presence for ALL 10 accounts (online flag + last-seen for offline ones)
+    conn.send({
+      type: 'presence',
+      list: ACCOUNTS.map(a => ({ acctId: a.id, online: worldByAcct.has(a.id), lastSeen: lastSeen.get(a.id) || null }))
+    });
+    // seat state
+    conn.send({ type: 'seats', seats: [...seats.entries()].map(([seat, acctId]) => ({ seat, acctId })) });
+    // recent chat history
+    conn.send({ type: 'chat_history', messages: chatHistory });
     broadcastCity({ type: 'joined', acctId: conn.acctId, name: conn.name, skin: conn.skin, x: conn.x, z: conn.z, face: conn.face }, conn);
+    broadcastCity({ type: 'presence_one', acctId: conn.acctId, online: true, lastSeen: null }, conn);
     return;
   }
 
   if (!conn.acctId) return; // everything below requires login
 
   if (msg.type === 'pos') {
-    conn.x = +msg.x || 0; conn.z = +msg.z || 0; conn.face = +msg.face || 0;
-    broadcastCity({ type: 'pos', acctId: conn.acctId, x: conn.x, z: conn.z, face: conn.face }, conn);
+    conn.x = +msg.x || 0; conn.z = +msg.z || 0; conn.face = +msg.face || 0; conn.driving = !!msg.driving;
+    broadcastCity({ type: 'pos', acctId: conn.acctId, x: conn.x, z: conn.z, face: conn.face, driving: conn.driving }, conn);
+    return;
+  }
+
+  if (msg.type === 'emote') {
+    const emoji = String(msg.emoji || '').slice(0, 8);
+    if (!emoji) return;
+    broadcastCity({ type: 'emote', acctId: conn.acctId, emoji });
+    return;
+  }
+
+  if (msg.type === 'seat_take') {
+    const seat = +msg.seat;
+    if (!Number.isFinite(seat)) return;
+    if (seats.has(seat) && seats.get(seat) !== conn.acctId) { conn.send({ type: 'seat_err', seat, msg: 'ဒီထိုင်ခုံ တစ်ယောက်ယောက် ထိုင်နေပြီးသားပါ' }); return; }
+    for (const [s, owner] of seats) { if (owner === conn.acctId && s !== seat) seats.delete(s); }
+    seats.set(seat, conn.acctId);
+    broadcastCity({ type: 'seat_update', seat, acctId: conn.acctId });
+    return;
+  }
+  if (msg.type === 'seat_leave') {
+    for (const [s, owner] of seats) { if (owner === conn.acctId) { seats.delete(s); broadcastCity({ type: 'seat_update', seat: s, acctId: null }); } }
     return;
   }
 
   if (msg.type === 'chat') {
-    const text = String(msg.text || '').slice(0, 140);
-    if (!text) return;
-    broadcastCity({ type: 'chat', acctId: conn.acctId, name: conn.name, text });
+    const text = String(msg.text || '').slice(0, 500);
+    const image = (typeof msg.image === 'string' && msg.image.length < 260000) ? msg.image : null;
+    if (!text && !image) return;
+    const m = { id: ++chatSeq, acctId: conn.acctId, name: conn.name, text, image, ts: Date.now(), edited: false, deleted: false, reactions: {}, seenBy: [conn.acctId] };
+    chatHistory.push(m); if (chatHistory.length > 200) chatHistory.shift();
+    broadcastCity({ type: 'chat_new', m });
+    return;
+  }
+  if (msg.type === 'chat_delete') {
+    const m = chatHistory.find(x => x.id === +msg.id);
+    if (!m || m.acctId !== conn.acctId || m.deleted) return;
+    m.deleted = true; m.text = ''; m.image = null;
+    broadcastCity({ type: 'chat_deleted', id: m.id });
+    return;
+  }
+  if (msg.type === 'chat_edit') {
+    const m = chatHistory.find(x => x.id === +msg.id);
+    if (!m || m.acctId !== conn.acctId || m.deleted || m.image) return;
+    const text = String(msg.text || '').slice(0, 500); if (!text) return;
+    m.text = text; m.edited = true;
+    broadcastCity({ type: 'chat_edited', id: m.id, text });
+    return;
+  }
+  if (msg.type === 'chat_react') {
+    const m = chatHistory.find(x => x.id === +msg.id);
+    if (!m || m.deleted) return;
+    const emoji = String(msg.emoji || '').slice(0, 8); if (!emoji) return;
+    if (!m.reactions[emoji]) m.reactions[emoji] = [];
+    const arr = m.reactions[emoji];
+    const at = arr.indexOf(conn.acctId);
+    if (at >= 0) arr.splice(at, 1); else { Object.keys(m.reactions).forEach(k => { const i2 = m.reactions[k].indexOf(conn.acctId); if (i2 >= 0) m.reactions[k].splice(i2, 1); }); arr.push(conn.acctId); }
+    if (arr.length === 0) delete m.reactions[emoji];
+    broadcastCity({ type: 'chat_reacted', id: m.id, reactions: m.reactions });
+    return;
+  }
+  if (msg.type === 'chat_seen') {
+    const upTo = +msg.upTo; if (!Number.isFinite(upTo)) return;
+    let changed = false;
+    for (const m of chatHistory) { if (m.id <= upTo && !m.seenBy.includes(conn.acctId)) { m.seenBy.push(conn.acctId); changed = true; } }
+    if (changed) broadcastCity({ type: 'chat_seen_update', acctId: conn.acctId, upTo });
     return;
   }
 
