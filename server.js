@@ -127,6 +127,7 @@ const lastSeen = new Map();               // acctId -> ms epoch of last disconne
 const seats = new Map();                  // seatIdx -> acctId (school classroom seats)
 const chatHistory = [];                   // rolling buffer of recent city-chat messages (persists across reconnects, lost on server restart)
 let chatSeq = 0;
+const scores = new Map();                 // game -> Map(acctId -> bestScore)
 
 function cleanup(conn) {
   if (!conn.alive) return;
@@ -169,7 +170,7 @@ function handleMessage(conn, msg) {
     // tell the newcomer who else is already in the city
     conn.send({
       type: 'roster',
-      players: [...worldByAcct.values()].filter(c => c !== conn).map(c => ({ acctId: c.acctId, name: c.name, skin: c.skin, x: c.x, z: c.z, face: c.face, driving: c.driving }))
+      players: [...worldByAcct.values()].filter(c => c !== conn).map(c => ({ acctId: c.acctId, name: c.name, skin: c.skin, x: c.x, z: c.z, face: c.face, y: c.y || 0, driving: c.driving, activity: c.activity || null }))
     });
     // presence for ALL 10 accounts (online flag + last-seen for offline ones)
     conn.send({
@@ -189,7 +190,8 @@ function handleMessage(conn, msg) {
 
   if (msg.type === 'pos') {
     conn.x = +msg.x || 0; conn.z = +msg.z || 0; conn.face = +msg.face || 0; conn.driving = !!msg.driving;
-    broadcastCity({ type: 'pos', acctId: conn.acctId, x: conn.x, z: conn.z, face: conn.face, driving: conn.driving }, conn);
+    conn.y = +msg.y || 0; conn.activity = msg.activity ? String(msg.activity).slice(0, 24) : null;
+    broadcastCity({ type: 'pos', acctId: conn.acctId, x: conn.x, z: conn.z, face: conn.face, y: conn.y, driving: conn.driving, activity: conn.activity }, conn);
     return;
   }
 
@@ -216,7 +218,11 @@ function handleMessage(conn, msg) {
 
   if (msg.type === 'chat') {
     const text = String(msg.text || '').slice(0, 500);
-    const image = (typeof msg.image === 'string' && msg.image.length < 260000) ? msg.image : null;
+    let image = null;
+    if (typeof msg.image === 'string') {
+      if (msg.image.length > 350000) { conn.send({ type: 'chat_err', msg: 'ပုံအရမ်းကြီးနေလို့ ပို့လို့မရပါ — ပုံသေးအောင် ပြန်ရွေးပေးပါ' }); return; }
+      image = msg.image;
+    }
     if (!text && !image) return;
     const m = { id: ++chatSeq, acctId: conn.acctId, name: conn.name, text, image, ts: Date.now(), edited: false, deleted: false, reactions: {}, seenBy: [conn.acctId] };
     chatHistory.push(m); if (chatHistory.length > 200) chatHistory.shift();
@@ -250,6 +256,29 @@ function handleMessage(conn, msg) {
     broadcastCity({ type: 'chat_reacted', id: m.id, reactions: m.reactions });
     return;
   }
+  if (msg.type === 'rename') {
+    const name = String(msg.name || '').trim().slice(0, 14); if (!name) return;
+    conn.name = name;
+    broadcastCity({ type: 'renamed', acctId: conn.acctId, name }, null);
+    return;
+  }
+
+  if (msg.type === 'score_submit') {
+    const game = String(msg.game || '').slice(0, 20); const score = Math.max(0, Math.floor(+msg.score || 0));
+    if (!game) return;
+    if (!scores.has(game)) scores.set(game, new Map());
+    const gmap = scores.get(game);
+    const cur = gmap.get(conn.acctId);
+    if (!cur || score > cur) { gmap.set(conn.acctId, score); broadcastCity({ type: 'scores', game, list: [...gmap.entries()].map(([acctId, s]) => ({ acctId, score: s })) }); }
+    return;
+  }
+  if (msg.type === 'scores_get') {
+    const game = String(msg.game || '').slice(0, 20);
+    const gmap = scores.get(game) || new Map();
+    conn.send({ type: 'scores', game, list: [...gmap.entries()].map(([acctId, s]) => ({ acctId, score: s })) });
+    return;
+  }
+
   if (msg.type === 'chat_seen') {
     const upTo = +msg.upTo; if (!Number.isFinite(upTo)) return;
     let changed = false;
