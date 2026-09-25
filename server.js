@@ -7,6 +7,7 @@
    =================================================================== */
 const http = require('http');
 const crypto = require('crypto');
+const fs = require('fs');
 
 const PORT = process.env.PORT || 8080;
 const WS_MAGIC = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
@@ -128,6 +129,36 @@ const seats = new Map();                  // seatIdx -> acctId (school classroom
 const chatHistory = [];                   // rolling buffer of recent city-chat messages (persists across reconnects, lost on server restart)
 let chatSeq = 0;
 const scores = new Map();                 // game -> Map(acctId -> bestScore)
+const pinned = new Set();                 // ids of pinned chat messages
+
+/* ---------------- disk persistence (survives normal restarts/redeploys as long as the disk itself persists) ---------------- */
+const path = require('path');
+const DATA_FILE = path.join(__dirname, 'data.json');
+function loadData() {
+  try {
+    const raw = fs.readFileSync(DATA_FILE, 'utf8');
+    const d = JSON.parse(raw);
+    if (Array.isArray(d.chatHistory)) chatHistory.push(...d.chatHistory);
+    chatSeq = d.chatSeq || 0;
+    if (Array.isArray(d.pinned)) d.pinned.forEach(id => pinned.add(id));
+    if (d.scores && typeof d.scores === 'object') {
+      Object.keys(d.scores).forEach(game => { scores.set(game, new Map(Object.entries(d.scores[game]).map(([k, v]) => [+k, v]))); });
+    }
+    console.log('Loaded', chatHistory.length, 'chat messages,', scores.size, 'score tables from disk.');
+  } catch (e) { /* no saved data yet, or unreadable — start fresh */ }
+}
+let saveTimer = null;
+function saveDataSoon() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    try {
+      const scoresObj = {};
+      scores.forEach((gmap, game) => { scoresObj[game] = Object.fromEntries(gmap); });
+      fs.writeFileSync(DATA_FILE, JSON.stringify({ chatHistory, chatSeq, pinned: [...pinned], scores: scoresObj }));
+    } catch (e) { console.log('save failed', e.message); }
+  }, 800);
+}
+loadData();
 
 function cleanup(conn) {
   if (!conn.alive) return;
@@ -181,6 +212,7 @@ function handleMessage(conn, msg) {
     conn.send({ type: 'seats', seats: [...seats.entries()].map(([seat, acctId]) => ({ seat, acctId })) });
     // recent chat history
     conn.send({ type: 'chat_history', messages: chatHistory });
+    conn.send({ type: 'chat_pins', pinned: [...pinned] });
     broadcastCity({ type: 'joined', acctId: conn.acctId, name: conn.name, skin: conn.skin, x: conn.x, z: conn.z, face: conn.face }, conn);
     broadcastCity({ type: 'presence_one', acctId: conn.acctId, online: true, lastSeen: null }, conn);
     return;
@@ -218,22 +250,31 @@ function handleMessage(conn, msg) {
 
   if (msg.type === 'chat') {
     const text = String(msg.text || '').slice(0, 500);
-    let image = null;
+    let image = null, audio = null, sticker = null, audioDur = 0;
     if (typeof msg.image === 'string') {
       if (msg.image.length > 350000) { conn.send({ type: 'chat_err', msg: 'ပုံအရမ်းကြီးနေလို့ ပို့လို့မရပါ — ပုံသေးအောင် ပြန်ရွေးပေးပါ' }); return; }
       image = msg.image;
     }
-    if (!text && !image) return;
-    const m = { id: ++chatSeq, acctId: conn.acctId, name: conn.name, text, image, ts: Date.now(), edited: false, deleted: false, reactions: {}, seenBy: [conn.acctId] };
+    if (typeof msg.audio === 'string') {
+      if (msg.audio.length > 900000) { conn.send({ type: 'chat_err', msg: 'အသံဖိုင် အရမ်းကြီးနေလို့ ပို့လို့မရပါ — ပိုတိုတိုပြန်ဖမ်းပေးပါ' }); return; }
+      audio = msg.audio; audioDur = Math.max(0, Math.min(120, +msg.audioDur || 0));
+    }
+    if (typeof msg.sticker === 'string') sticker = msg.sticker.slice(0, 8);
+    if (!text && !image && !audio && !sticker) return;
+    const m = { id: ++chatSeq, acctId: conn.acctId, name: conn.name, text, image, audio, audioDur, sticker, ts: Date.now(), edited: false, deleted: false, reactions: {}, seenBy: [conn.acctId] };
     chatHistory.push(m); if (chatHistory.length > 200) chatHistory.shift();
-    broadcastCity({ type: 'chat_new', m });
+    broadcastCity({ type: 'chat_new', m }); saveDataSoon();
+    return;
+  }
+  if (msg.type === 'typing') {
+    broadcastCity({ type: 'typing', acctId: conn.acctId });
     return;
   }
   if (msg.type === 'chat_delete') {
     const m = chatHistory.find(x => x.id === +msg.id);
     if (!m || m.acctId !== conn.acctId || m.deleted) return;
-    m.deleted = true; m.text = ''; m.image = null;
-    broadcastCity({ type: 'chat_deleted', id: m.id });
+    m.deleted = true; m.text = ''; m.image = null; m.audio = null; m.sticker = null;
+    broadcastCity({ type: 'chat_deleted', id: m.id }); saveDataSoon();
     return;
   }
   if (msg.type === 'chat_edit') {
@@ -241,7 +282,7 @@ function handleMessage(conn, msg) {
     if (!m || m.acctId !== conn.acctId || m.deleted || m.image) return;
     const text = String(msg.text || '').slice(0, 500); if (!text) return;
     m.text = text; m.edited = true;
-    broadcastCity({ type: 'chat_edited', id: m.id, text });
+    broadcastCity({ type: 'chat_edited', id: m.id, text }); saveDataSoon();
     return;
   }
   if (msg.type === 'chat_react') {
@@ -253,7 +294,7 @@ function handleMessage(conn, msg) {
     const at = arr.indexOf(conn.acctId);
     if (at >= 0) arr.splice(at, 1); else { Object.keys(m.reactions).forEach(k => { const i2 = m.reactions[k].indexOf(conn.acctId); if (i2 >= 0) m.reactions[k].splice(i2, 1); }); arr.push(conn.acctId); }
     if (arr.length === 0) delete m.reactions[emoji];
-    broadcastCity({ type: 'chat_reacted', id: m.id, reactions: m.reactions });
+    broadcastCity({ type: 'chat_reacted', id: m.id, reactions: m.reactions }); saveDataSoon();
     return;
   }
   if (msg.type === 'rename') {
@@ -269,13 +310,21 @@ function handleMessage(conn, msg) {
     if (!scores.has(game)) scores.set(game, new Map());
     const gmap = scores.get(game);
     const cur = gmap.get(conn.acctId);
-    if (!cur || score > cur) { gmap.set(conn.acctId, score); broadcastCity({ type: 'scores', game, list: [...gmap.entries()].map(([acctId, s]) => ({ acctId, score: s })) }); }
+    if (!cur || score > cur) { gmap.set(conn.acctId, score); broadcastCity({ type: 'scores', game, list: [...gmap.entries()].map(([acctId, s]) => ({ acctId, score: s })) }); saveDataSoon(); }
     return;
   }
   if (msg.type === 'scores_get') {
     const game = String(msg.game || '').slice(0, 20);
     const gmap = scores.get(game) || new Map();
     conn.send({ type: 'scores', game, list: [...gmap.entries()].map(([acctId, s]) => ({ acctId, score: s })) });
+    return;
+  }
+
+  if (msg.type === 'chat_pin') {
+    const id = +msg.id; const m = chatHistory.find(x => x.id === id);
+    if (!m || m.deleted) return;
+    if (pinned.has(id)) pinned.delete(id); else { pinned.add(id); if (pinned.size > 5) { const first = pinned.values().next().value; pinned.delete(first); } }
+    broadcastCity({ type: 'chat_pins', pinned: [...pinned] }); saveDataSoon();
     return;
   }
 
