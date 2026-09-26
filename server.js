@@ -106,7 +106,7 @@ server.on('upgrade', (req, socket) => {
     'Connection: Upgrade\r\n' +
     'Sec-WebSocket-Accept: ' + accept + '\r\n\r\n'
   );
-  const conn = { socket, id: null, acctId: null, name: null, skin: null, x: 0, z: 0, face: 0, party: null, alive: true, driving: false };
+  const conn = { socket, id: null, acctId: null, name: null, skin: null, x: 0, z: 0, face: 0, party: null, race: null, hs: null, ttt: null, hk: null, alive: true, driving: false };
   const send = (obj) => { try { socket.write(encodeFrame(JSON.stringify(obj))); } catch (e) {} };
   conn.send = send;
   clients.add(conn);
@@ -124,6 +124,10 @@ server.on('upgrade', (req, socket) => {
 const clients = new Set();               // all connected sockets (wrapper objects)
 const worldByAcct = new Map();            // acctId -> conn (one active session per account)
 const parties = new Map();                // code -> party object
+const raceParties = new Map();            // code -> race party object
+const hsParties = new Map();              // code -> hide-and-seek party object
+const tttParties = new Map();             // code -> tic-tac-toe party object (exactly 2 players)
+const hkParties = new Map();              // code -> air hockey party object (exactly 2 players)
 const lastSeen = new Map();               // acctId -> ms epoch of last disconnect (absent/undefined = never seen or currently online)
 const seats = new Map();                  // seatIdx -> acctId (school classroom seats)
 const chatHistory = [];                   // rolling buffer of recent city-chat messages (persists across reconnects, lost on server restart)
@@ -173,6 +177,10 @@ function cleanup(conn) {
     for (const [seatIdx, owner] of seats) { if (owner === conn.acctId) { seats.delete(seatIdx); broadcastCity({ type: 'seat_update', seat: seatIdx, acctId: null }); } }
   }
   if (conn.party) leaveParty(conn, conn.party);
+  if (conn.race) leaveRace(conn, conn.race);
+  if (conn.hs) leaveHS(conn, conn.hs);
+  if (conn.ttt) leaveTTT(conn, conn.ttt);
+  if (conn.hk) leaveHK(conn, conn.hk);
 }
 
 function broadcastCity(obj, exceptConn) {
@@ -344,6 +352,36 @@ function handleMessage(conn, msg) {
   if (msg.type === 'party_hint') { partyHint(conn, String(msg.text || '')); return; }
   if (msg.type === 'party_vote') { partyVote(conn, msg.target); return; }
   if (msg.type === 'party_guess') { partyGuess(conn, msg.guess); return; }
+
+  if (msg.type === 'race_create') { raceCreate(conn); return; }
+  if (msg.type === 'race_join') { raceJoin(conn, String(msg.code || '').toUpperCase()); return; }
+  if (msg.type === 'race_leave') { leaveRace(conn, conn.race); return; }
+  if (msg.type === 'race_start') { raceStart(conn); return; }
+  if (msg.type === 'race_pos') { raceBroadcast(conn, { type: 'race_pos', acctId: conn.acctId, cum: msg.cum, x: msg.x, z: msg.z, h: msg.h }); return; }
+  if (msg.type === 'race_finish') { raceFinish(conn, +msg.time || 0); return; }
+
+  if (msg.type === 'hs_create') { hsCreate(conn); return; }
+  if (msg.type === 'hs_join') { hsJoin(conn, String(msg.code || '').toUpperCase()); return; }
+  if (msg.type === 'hs_leave') { leaveHS(conn, conn.hs); return; }
+  if (msg.type === 'hs_start') { hsStart(conn, +msg.roundMs || 180000); return; }
+  if (msg.type === 'hs_pos') { hsBroadcast(conn, { type: 'hs_pos', acctId: conn.acctId, x: msg.x, z: msg.z, face: msg.face }); return; }
+  if (msg.type === 'hs_tag') { hsTag(conn, +msg.target); return; }
+  if (msg.type === 'hs_quiz_answer') { hsQuizAnswer(conn, +msg.qid, +msg.choice); return; }
+
+  if (msg.type === 'ttt_create') { tttCreate(conn); return; }
+  if (msg.type === 'ttt_join') { tttJoin(conn, String(msg.code || '').toUpperCase()); return; }
+  if (msg.type === 'ttt_leave') { leaveTTT(conn, conn.ttt); return; }
+  if (msg.type === 'ttt_start') { tttStartGame(conn); return; }
+  if (msg.type === 'ttt_move') { tttMove(conn, +msg.cell); return; }
+  if (msg.type === 'ttt_rematch') { tttRematch(conn); return; }
+
+  if (msg.type === 'hk_create') { hkCreate(conn); return; }
+  if (msg.type === 'hk_join') { hkJoin(conn, String(msg.code || '').toUpperCase()); return; }
+  if (msg.type === 'hk_leave') { leaveHK(conn, conn.hk); return; }
+  if (msg.type === 'hk_start') { hkStartGame(conn); return; }
+  if (msg.type === 'hk_paddle') { hkRelayPaddle(conn, msg.x, msg.y); return; }
+  if (msg.type === 'hk_sync') { hkRelaySync(conn, msg); return; }
+  if (msg.type === 'hk_rematch') { hkRematch(conn); return; }
 }
 
 /* ---------------- Imposter party logic (server-authoritative) ---------------- */
@@ -475,6 +513,329 @@ function finishGame(party, crewWin, impGuessCorrect) {
   partyBroadcast(party, { type: 'party_over', crewWin, impGuessCorrect, word: g.W.w, en: g.W.en, imps: [...g.imp] });
   party.phase = 'lobby'; party.game = null;
   partyBroadcast(party, { type: 'party_state', party: publicParty(party) });
+}
+
+/* ---------------- online race party ---------------- */
+function raceCreate(conn) {
+  if (conn.race) leaveRace(conn, conn.race);
+  let code; do { code = code4(); } while (raceParties.has(code));
+  const party = { code, host: conn.acctId, members: [{ acctId: conn.acctId, name: conn.name, skin: conn.skin }], phase: 'lobby', finishes: [], finishTimer: null };
+  raceParties.set(code, party); conn.race = code;
+  conn.send({ type: 'race_state', party: publicRace(party) });
+}
+function raceJoin(conn, code) {
+  const party = raceParties.get(code);
+  if (!party) { conn.send({ type: 'race_err', msg: 'ခန်းမ မတွေ့ပါ' }); return; }
+  if (party.phase !== 'lobby') { conn.send({ type: 'race_err', msg: 'ပြိုင်ပွဲ စပြီးသားပါ' }); return; }
+  if (party.members.length >= 7) { conn.send({ type: 'race_err', msg: 'ခန်းမပြည့်သွားပြီ' }); return; }
+  if (party.members.some(m => m.acctId === conn.acctId)) { conn.race = code; conn.send({ type: 'race_state', party: publicRace(party) }); return; }
+  if (conn.race) leaveRace(conn, conn.race);
+  party.members.push({ acctId: conn.acctId, name: conn.name, skin: conn.skin });
+  conn.race = code;
+  raceBroadcastAll(party, { type: 'race_state', party: publicRace(party) });
+}
+function leaveRace(conn, code) {
+  if (!code) return;
+  const party = raceParties.get(code); conn.race = null;
+  if (!party) return;
+  party.members = party.members.filter(m => m.acctId !== conn.acctId);
+  if (!party.members.length) { clearTimeout(party.finishTimer); raceParties.delete(code); return; }
+  if (party.host === conn.acctId) party.host = party.members[0].acctId;
+  if (party.phase === 'racing') maybeFinishRace(party);
+  raceBroadcastAll(party, { type: 'race_state', party: publicRace(party) });
+}
+function publicRace(party) { return { code: party.code, host: party.host, members: party.members, phase: party.phase }; }
+function raceConnByAcct(acctId) { return worldByAcct.get(acctId); }
+function raceBroadcastAll(party, obj) { const msg = JSON.stringify(obj); for (const m of party.members) { const c = raceConnByAcct(m.acctId); if (c) try { c.socket.write(encodeFrame(msg)); } catch (e) {} } }
+function raceBroadcast(conn, obj) { const party = raceParties.get(conn.race); if (!party || party.phase !== 'racing') return; const msg = JSON.stringify(obj); for (const m of party.members) { if (m.acctId === conn.acctId) continue; const c = raceConnByAcct(m.acctId); if (c) try { c.socket.write(encodeFrame(msg)); } catch (e) {} } }
+function raceStart(conn) {
+  const party = raceParties.get(conn.race);
+  if (!party || party.host !== conn.acctId || party.phase !== 'lobby') return;
+  if (party.members.length < 3) { conn.send({ type: 'race_err', msg: 'အနည်းဆုံး ၃ ယောက် လိုပါသေးတယ်' }); return; }
+  party.phase = 'racing'; party.finishes = [];
+  raceBroadcastAll(party, { type: 'race_started', members: party.members });
+}
+function raceFinish(conn, time) {
+  const party = raceParties.get(conn.race);
+  if (!party || party.phase !== 'racing') return;
+  if (party.finishes.some(f => f.acctId === conn.acctId)) return;
+  const place = party.finishes.length + 1;
+  party.finishes.push({ acctId: conn.acctId, time, place });
+  raceBroadcastAll(party, { type: 'race_finished', acctId: conn.acctId, time, place });
+  if (party.finishes.length === 1) party.finishTimer = setTimeout(() => finishRaceNow(party), 90000);
+  maybeFinishRace(party);
+}
+function maybeFinishRace(party) {
+  if (party.phase !== 'racing') return;
+  if (party.finishes.length >= party.members.length) finishRaceNow(party);
+}
+function finishRaceNow(party) {
+  if (party.phase !== 'racing') return;
+  clearTimeout(party.finishTimer);
+  party.phase = 'lobby';
+  raceBroadcastAll(party, { type: 'race_results', results: party.finishes.slice().sort((a, b) => a.place - b.place) });
+  raceBroadcastAll(party, { type: 'race_state', party: publicRace(party) });
+}
+
+/* ---------------- N1 kanji word bank (for the hide-and-seek escape quiz) ---------------- */
+const N1_WORDS = [
+  ['遂行', 'すいこう'], ['促進', 'そくしん'], ['緩和', 'かんわ'], ['是正', 'ぜせい'], ['顕著', 'けんちょ'],
+  ['妥当', 'だとう'], ['懸念', 'けねん'], ['傾向', 'けいこう'], ['概念', 'がいねん'], ['徹底', 'てってい'],
+  ['顕在', 'けんざい'], ['潜在', 'せんざい'], ['是非', 'ぜひ'], ['妨害', 'ぼうがい'], ['促す', 'うながす'],
+  ['培う', 'つちかう'], ['携わる', 'たずさわる'], ['遮る', 'さえぎる'], ['委ねる', 'ゆだねる'], ['覆す', 'くつがえす'],
+  ['阻む', 'はばむ'], ['貫く', 'つらぬく'], ['費やす', 'ついやす'], ['巧み', 'たくみ'], ['円滑', 'えんかつ'],
+  ['迅速', 'じんそく'], ['融通', 'ゆうずう'], ['煩雑', 'はんざつ'], ['妥協', 'だきょう'], ['謙虚', 'けんきょ'],
+  ['傲慢', 'ごうまん'], ['愚痴', 'ぐち'], ['皮肉', 'ひにく'], ['疎か', 'おろそか'], ['曖昧', 'あいまい'],
+  ['露骨', 'ろこつ'], ['厳密', 'げんみつ'], ['慎重', 'しんちょう'], ['大胆', 'だいたん'], ['冷静', 'れいせい'],
+  ['焦る', 'あせる'], ['怠る', 'おこたる'], ['悟る', 'さとる'], ['慰める', 'なぐさめる'], ['嘆く', 'なげく'],
+  ['悔やむ', 'くやむ'], ['施す', 'ほどこす'], ['賄う', 'まかなう'], ['該当', 'がいとう'], ['網羅', 'もうら'],
+  ['把握', 'はあく'], ['均衡', 'きんこう'], ['抑制', 'よくせい'], ['是認', 'ぜにん'], ['潤沢', 'じゅんたく'],
+  ['逸脱', 'いつだつ'], ['折衷', 'せっちゅう'], ['齟齬', 'そご'], ['拘束', 'こうそく'], ['脅威', 'きょうい'],
+  ['施策', 'しさく'], ['醸成', 'じょうせい'], ['逐一', 'ちくいち'], ['如実', 'にょじつ'], ['円満', 'えんまん'],
+  ['遵守', 'じゅんしゅ'], ['逐次', 'ちくじ'], ['甚だしい', 'はなはだしい'], ['著しい', 'いちじるしい'], ['煽る', 'あおる'],
+  ['賄賂', 'わいろ'], ['唆す', 'そそのかす'], ['阻害', 'そがい'], ['打開', 'だかい'], ['遮断', 'しゃだん']
+];
+function randChoice(arr) { return arr[(Math.random() * arr.length) | 0]; }
+function makeN1Question() {
+  const [kanji, correct] = randChoice(N1_WORDS);
+  const distractors = new Set();
+  while (distractors.size < 4) { const [, r] = randChoice(N1_WORDS); if (r !== correct) distractors.add(r); }
+  const choices = [correct, ...distractors].sort(() => Math.random() - 0.5);
+  return { kanji, correctIdx: choices.indexOf(correct), choices };
+}
+
+/* ---------------- hide-and-seek party ---------------- */
+function hsCreate(conn) {
+  if (conn.hs) leaveHS(conn, conn.hs);
+  let code; do { code = code4(); } while (hsParties.has(code));
+  const party = { code, host: conn.acctId, members: [{ acctId: conn.acctId, name: conn.name, skin: conn.skin }], phase: 'lobby', seeker: null, found: [], quizzes: new Map(), roundTimer: null, hideTimer: null };
+  hsParties.set(code, party); conn.hs = code;
+  conn.send({ type: 'hs_state', party: hsPublic(party) });
+}
+function hsJoin(conn, code) {
+  const party = hsParties.get(code);
+  if (!party) { conn.send({ type: 'hs_err', msg: 'ခန်းမ မတွေ့ပါ' }); return; }
+  if (party.phase !== 'lobby') { conn.send({ type: 'hs_err', msg: 'ဂိမ်း စပြီးသားပါ' }); return; }
+  if (party.members.length >= 7) { conn.send({ type: 'hs_err', msg: 'ခန်းမပြည့်သွားပြီ' }); return; }
+  if (party.members.some(m => m.acctId === conn.acctId)) { conn.hs = code; conn.send({ type: 'hs_state', party: hsPublic(party) }); return; }
+  if (conn.hs) leaveHS(conn, conn.hs);
+  party.members.push({ acctId: conn.acctId, name: conn.name, skin: conn.skin });
+  conn.hs = code;
+  hsBroadcastAll(party, { type: 'hs_state', party: hsPublic(party) });
+}
+function leaveHS(conn, code) {
+  if (!code) return;
+  const party = hsParties.get(code); conn.hs = null;
+  if (!party) return;
+  const wasSeeker = party.seeker === conn.acctId;
+  party.members = party.members.filter(m => m.acctId !== conn.acctId);
+  if (!party.members.length) { clearTimeout(party.roundTimer); clearTimeout(party.hideTimer); party.quizzes.forEach(q => clearTimeout(q.timer)); hsParties.delete(code); return; }
+  if (party.host === conn.acctId) party.host = party.members[0].acctId;
+  if (party.phase !== 'lobby' && wasSeeker) { hsEndRound(party, false); }
+  else if (party.phase !== 'lobby') { hsCheckAllCaught(party); }
+  hsBroadcastAll(party, { type: 'hs_state', party: hsPublic(party) });
+}
+function hsPublic(party) { return { code: party.code, host: party.host, members: party.members, phase: party.phase, seeker: party.seeker }; }
+function hsConnByAcct(acctId) { return worldByAcct.get(acctId); }
+function hsBroadcastAll(party, obj) { const msg = JSON.stringify(obj); for (const m of party.members) { const c = hsConnByAcct(m.acctId); if (c) try { c.socket.write(encodeFrame(msg)); } catch (e) {} } }
+function hsBroadcast(conn, obj) { const party = hsParties.get(conn.hs); if (!party || party.phase === 'lobby') return; const msg = JSON.stringify(obj); for (const m of party.members) { if (m.acctId === conn.acctId) continue; const c = hsConnByAcct(m.acctId); if (c) try { c.socket.write(encodeFrame(msg)); } catch (e) {} } }
+function hsStart(conn, roundMs) {
+  const party = hsParties.get(conn.hs);
+  if (!party || party.host !== conn.acctId || party.phase !== 'lobby') return;
+  if (party.members.length < 2) { conn.send({ type: 'hs_err', msg: 'အနည်းဆုံး ၂ ယောက် လိုပါသေးတယ်' }); return; }
+  const rMs = (roundMs === 300000) ? 300000 : 180000; // 5 min or default 3 min
+  const seeker = randChoice(party.members).acctId;
+  party.phase = 'hiding'; party.seeker = seeker; party.found = []; party.quizzes.forEach(q => clearTimeout(q.timer)); party.quizzes = new Map();
+  const hideMs = 30000, startTs = Date.now();
+  hsBroadcastAll(party, { type: 'hs_started', members: party.members, seeker, hideMs, startTs, roundMs: rMs });
+  party.hideTimer = setTimeout(() => { if (hsParties.get(conn.hs) === party && party.phase === 'hiding') party.phase = 'seeking'; }, hideMs);
+  party.roundTimer = setTimeout(() => hsEndRound(party, false), rMs);
+}
+function hsTag(conn, target) {
+  const party = hsParties.get(conn.hs);
+  if (!party || party.phase !== 'seeking' || party.seeker !== conn.acctId) return;
+  if (target === conn.acctId) return;
+  if (!party.members.some(m => m.acctId === target)) return;
+  if (party.found.includes(target)) return;
+  party.found.push(target);
+  const q = makeN1Question();
+  const rec = { qid: ++hsQuizSeq, correctIdx: q.correctIdx };
+  rec.timer = setTimeout(() => hsQuizResolve(party, target, rec.qid, -1), 12000);
+  party.quizzes.set(target, rec);
+  hsBroadcastAll(party, { type: 'hs_found', acctId: target });
+  const tc = hsConnByAcct(target);
+  if (tc) tc.send({ type: 'hs_quiz', qid: rec.qid, kanji: q.kanji, choices: q.choices });
+}
+function hsQuizAnswer(conn, qid, choice) {
+  const party = hsParties.get(conn.hs);
+  if (!party) return;
+  const rec = party.quizzes.get(conn.acctId);
+  if (!rec || rec.qid !== qid) return;
+  hsQuizResolve(party, conn.acctId, qid, choice);
+}
+function hsQuizResolve(party, acctId, qid, choice) {
+  const rec = party.quizzes.get(acctId);
+  if (!rec || rec.qid !== qid) return;
+  clearTimeout(rec.timer); party.quizzes.delete(acctId);
+  const correct = choice === rec.correctIdx;
+  const order = party.found.indexOf(acctId) + 1; // 1st caught, 2nd caught, ...
+  const reward = correct ? order * 5 : 0;
+  hsBroadcastAll(party, { type: 'hs_quiz_result', acctId, correct, reward });
+  hsCheckAllCaught(party);
+}
+function hsCheckAllCaught(party) {
+  if (party.phase !== 'seeking' && party.phase !== 'hiding') return;
+  if (party.quizzes.size > 0) return; // let every pending kanji question resolve before ending the round
+  const hiderCount = party.members.filter(m => m.acctId !== party.seeker).length;
+  if (hiderCount > 0 && party.found.length >= hiderCount) hsEndRound(party, true);
+}
+function hsEndRound(party, allCaught) {
+  clearTimeout(party.roundTimer); clearTimeout(party.hideTimer);
+  party.quizzes.forEach(q => clearTimeout(q.timer)); party.quizzes = new Map();
+  party.phase = 'lobby';
+  hsBroadcastAll(party, { type: 'hs_round_over', allCaught, foundCount: party.found.length });
+  hsBroadcastAll(party, { type: 'hs_state', party: hsPublic(party) });
+}
+let hsQuizSeq = 0;
+
+/* ---------------- online Tic-Tac-Toe (2 players, server-authoritative) ---------------- */
+const TTT_LINES = [[0,1,2],[3,4,5],[6,7,8],[0,3,6],[1,4,7],[2,5,8],[0,4,8],[2,4,6]];
+function tttCheck(board) {
+  for (const l of TTT_LINES) { const [a,b,c] = l; if (board[a] && board[a] === board[b] && board[b] === board[c]) return { winner: board[a], line: l }; }
+  if (board.every(c => c)) return { winner: null, line: null, draw: true };
+  return null;
+}
+function tttCreate(conn) {
+  if (conn.ttt) leaveTTT(conn, conn.ttt);
+  let code; do { code = code4(); } while (tttParties.has(code));
+  const party = { code, host: conn.acctId, members: [{ acctId: conn.acctId, name: conn.name, skin: conn.skin }], phase: 'lobby', board: Array(9).fill(null), turn: 'X', xAcct: null, oAcct: null, score: { X: 0, O: 0, D: 0 } };
+  tttParties.set(code, party); conn.ttt = code;
+  conn.send({ type: 'ttt_state', party: tttPublic(party) });
+}
+function tttJoin(conn, code) {
+  const party = tttParties.get(code);
+  if (!party) { conn.send({ type: 'ttt_err', msg: 'ခန်းမ မတွေ့ပါ' }); return; }
+  if (party.members.some(m => m.acctId === conn.acctId)) { conn.ttt = code; conn.send({ type: 'ttt_state', party: tttPublic(party) }); return; }
+  if (party.members.length >= 2) { conn.send({ type: 'ttt_err', msg: 'ခန်းမပြည့်သွားပြီ (2 ယောက်ပဲ ကစားလို့ရတယ်)' }); return; }
+  if (conn.ttt) leaveTTT(conn, conn.ttt);
+  party.members.push({ acctId: conn.acctId, name: conn.name, skin: conn.skin });
+  conn.ttt = code;
+  tttBroadcastAll(party, { type: 'ttt_state', party: tttPublic(party) });
+}
+function leaveTTT(conn, code) {
+  if (!code) return;
+  const party = tttParties.get(code); conn.ttt = null;
+  if (!party) return;
+  party.members = party.members.filter(m => m.acctId !== conn.acctId);
+  if (!party.members.length) { tttParties.delete(code); return; }
+  if (party.host === conn.acctId) party.host = party.members[0].acctId;
+  party.phase = 'lobby';
+  tttBroadcastAll(party, { type: 'ttt_state', party: tttPublic(party) });
+}
+function tttPublic(party) { return { code: party.code, host: party.host, members: party.members, phase: party.phase, board: party.board, turn: party.turn, xAcct: party.xAcct, oAcct: party.oAcct, score: party.score }; }
+function tttConnByAcct(acctId) { return worldByAcct.get(acctId); }
+function tttBroadcastAll(party, obj) { const msg = JSON.stringify(obj); for (const m of party.members) { const c = tttConnByAcct(m.acctId); if (c) try { c.socket.write(encodeFrame(msg)); } catch (e) {} } }
+function tttStartGame(conn) {
+  const party = tttParties.get(conn.ttt);
+  if (!party || party.host !== conn.acctId || party.phase !== 'lobby') return;
+  if (party.members.length < 2) { conn.send({ type: 'ttt_err', msg: 'နောက်တစ်ယောက် လိုပါသေးတယ်' }); return; }
+  const [a, b] = party.members;
+  const xFirst = Math.random() < 0.5;
+  party.xAcct = xFirst ? a.acctId : b.acctId;
+  party.oAcct = xFirst ? b.acctId : a.acctId;
+  party.board = Array(9).fill(null); party.turn = 'X'; party.phase = 'playing';
+  tttBroadcastAll(party, { type: 'ttt_state', party: tttPublic(party) });
+}
+function tttMove(conn, cell) {
+  const party = tttParties.get(conn.ttt);
+  if (!party || party.phase !== 'playing') return;
+  if (!Number.isInteger(cell) || cell < 0 || cell > 8 || party.board[cell]) return;
+  const mark = party.turn;
+  const acctForMark = mark === 'X' ? party.xAcct : party.oAcct;
+  if (acctForMark !== conn.acctId) return;
+  party.board[cell] = mark;
+  const r = tttCheck(party.board);
+  if (r) {
+    party.phase = 'over';
+    if (r.draw) party.score.D++; else party.score[r.winner]++;
+    tttBroadcastAll(party, { type: 'ttt_state', party: tttPublic(party) });
+    tttBroadcastAll(party, { type: 'ttt_over', winner: r.winner, line: r.line, draw: !!r.draw });
+  } else {
+    party.turn = mark === 'X' ? 'O' : 'X';
+    tttBroadcastAll(party, { type: 'ttt_state', party: tttPublic(party) });
+  }
+}
+function tttRematch(conn) {
+  const party = tttParties.get(conn.ttt);
+  if (!party || party.phase !== 'over') return;
+  const oldX = party.xAcct;
+  party.xAcct = party.oAcct; party.oAcct = oldX; // swap sides each rematch
+  party.board = Array(9).fill(null); party.turn = 'X'; party.phase = 'playing';
+  tttBroadcastAll(party, { type: 'ttt_state', party: tttPublic(party) });
+}
+
+/* ---------------- online Air Hockey (2 players; host's client is the physics authority, guest is a thin client) ---------------- */
+function hkCreate(conn) {
+  if (conn.hk) leaveHK(conn, conn.hk);
+  let code; do { code = code4(); } while (hkParties.has(code));
+  const party = { code, host: conn.acctId, members: [{ acctId: conn.acctId, name: conn.name, skin: conn.skin }], phase: 'lobby', score: { p1: 0, p2: 0 } };
+  hkParties.set(code, party); conn.hk = code;
+  conn.send({ type: 'hk_state', party: hkPublic(party) });
+}
+function hkJoin(conn, code) {
+  const party = hkParties.get(code);
+  if (!party) { conn.send({ type: 'hk_err', msg: 'ခန်းမ မတွေ့ပါ' }); return; }
+  if (party.members.some(m => m.acctId === conn.acctId)) { conn.hk = code; conn.send({ type: 'hk_state', party: hkPublic(party) }); return; }
+  if (party.members.length >= 2) { conn.send({ type: 'hk_err', msg: 'ခန်းမပြည့်သွားပြီ (2 ယောက်ပဲ ကစားလို့ရတယ်)' }); return; }
+  if (conn.hk) leaveHK(conn, conn.hk);
+  party.members.push({ acctId: conn.acctId, name: conn.name, skin: conn.skin });
+  conn.hk = code;
+  hkBroadcastAll(party, { type: 'hk_state', party: hkPublic(party) });
+}
+function leaveHK(conn, code) {
+  if (!code) return;
+  const party = hkParties.get(code); conn.hk = null;
+  if (!party) return;
+  party.members = party.members.filter(m => m.acctId !== conn.acctId);
+  if (!party.members.length) { hkParties.delete(code); return; }
+  if (party.host === conn.acctId) party.host = party.members[0].acctId;
+  party.phase = 'lobby';
+  hkBroadcastAll(party, { type: 'hk_state', party: hkPublic(party) });
+}
+function hkPublic(party) { return { code: party.code, host: party.host, members: party.members, phase: party.phase, score: party.score }; }
+function hkConnByAcct(acctId) { return worldByAcct.get(acctId); }
+function hkBroadcastAll(party, obj) { const msg = JSON.stringify(obj); for (const m of party.members) { const c = hkConnByAcct(m.acctId); if (c) try { c.socket.write(encodeFrame(msg)); } catch (e) {} } }
+function hkOther(party, acctId) { const m = party.members.find(x => x.acctId !== acctId); return m ? hkConnByAcct(m.acctId) : null; }
+function hkStartGame(conn) {
+  const party = hkParties.get(conn.hk);
+  if (!party || party.host !== conn.acctId || party.phase !== 'lobby') return;
+  if (party.members.length < 2) { conn.send({ type: 'hk_err', msg: 'နောက်တစ်ယောက် လိုပါသေးတယ်' }); return; }
+  party.phase = 'playing'; party.score = { p1: 0, p2: 0 };
+  hkBroadcastAll(party, { type: 'hk_started', hostAcct: party.host, members: party.members });
+}
+function hkRelayPaddle(conn, x, y) {
+  const party = hkParties.get(conn.hk);
+  if (!party || party.phase !== 'playing') return;
+  const other = hkOther(party, conn.acctId);
+  if (other) other.send({ type: 'hk_paddle', acctId: conn.acctId, x, y });
+}
+function hkRelaySync(conn, msg) {
+  const party = hkParties.get(conn.hk);
+  if (!party || party.phase !== 'playing' || party.host !== conn.acctId) return; // only the host is the physics authority
+  party.score = msg.score || party.score;
+  const other = hkOther(party, conn.acctId);
+  if (other) other.send({ type: 'hk_sync', puck: msg.puck, score: party.score, hostPaddle: msg.hostPaddle, tableW: msg.tableW, tableH: msg.tableH });
+  if (party.score.p1 >= 7 || party.score.p2 >= 7) {
+    party.phase = 'lobby';
+    hkBroadcastAll(party, { type: 'hk_over', winner: party.score.p1 >= 7 ? 'p1' : 'p2' });
+    hkBroadcastAll(party, { type: 'hk_state', party: hkPublic(party) });
+  }
+}
+function hkRematch(conn) {
+  const party = hkParties.get(conn.hk);
+  if (!party) return;
+  party.phase = 'playing'; party.score = { p1: 0, p2: 0 };
+  hkBroadcastAll(party, { type: 'hk_started', hostAcct: party.host, members: party.members });
 }
 
 server.listen(PORT, () => console.log('DARKEST X server listening on :' + PORT));
